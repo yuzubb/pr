@@ -9,7 +9,7 @@ const app = express();
 // ==========================================
 
 const WORKER_CONFIGS = [
-    "https://aniwaves.nu",
+    "https://aniwaves.ru",
 ];
 
 const workers = WORKER_CONFIGS.map(url => ({
