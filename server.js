@@ -55,11 +55,19 @@ app.use(
     })
 );
 
-function rewriteHtml(html, publicOrigin) {
-    // 絶対URL・プロトコル相対URLの置換
-    html = html.replace(/https?:\/\/aniwaves\.ru/gi, publicOrigin);
-    html = html.replace(/\/\/aniwaves\.ru/gi, publicOrigin.replace(/^https?:/, ''));
-    return html;
+// HTML / JS テキストのドメイン置換処理
+function rewriteTextContent(content, publicOrigin) {
+    // 1. 絶対URL & プロトコル相対URL の置換
+    let rewritten = content.replace(/https?:\/\/aniwaves\.ru/gi, publicOrigin);
+    rewritten = rewritten.replace(/\/\/aniwaves\.ru/gi, publicOrigin.replace(/^https?:/, ''));
+
+    // 2. Service Worker 登録文を無効化（SecurityError によるスクリプト停止を防ぐ）
+    rewritten = rewritten.replace(/navigator\.serviceWorker\.register/g, 'console.log');
+
+    // 3. アンチデバッグ文 (debugger;) の除去
+    rewritten = rewritten.replace(/debugger;/g, '').replace(/debugger/g, '');
+
+    return rewritten;
 }
 
 function rewriteLocation(location, publicOrigin) {
@@ -73,10 +81,11 @@ function rewriteLocation(location, publicOrigin) {
     return location;
 }
 
-// Service Worker の無効化
+// Service Worker 自体のリクエストはダミーを返す
 app.get(['/sw.js', '/service-worker.js'], (req, res) => {
+    res.set('Content-Type', 'application/javascript');
     res.set('Cache-Control', 'no-store');
-    return res.status(404).send('Not Found');
+    return res.send('// Service Worker Disabled');
 });
 
 app.get('/favicon.ico', (req, res) => {
@@ -96,7 +105,6 @@ app.all('*', async (req, res) => {
     delete headers.connection;
     delete headers['content-length'];
 
-    // Worker側のOriginチェック回避
     headers.origin = worker.url;
     headers.referer = worker.url + '/';
     headers['x-forwarded-host'] = req.get('host') || '';
@@ -129,7 +137,6 @@ app.all('*', async (req, res) => {
 
         const contentType = response.headers.get('content-type') || '';
         
-        // 不要・害になるレスポンスヘッダーを除去
         const blockedHeaders = new Set([
             'content-length',
             'content-encoding',
@@ -151,7 +158,7 @@ app.all('*', async (req, res) => {
             res.set(key, value);
         });
 
-        // Set-Cookie のドメイン書き換え
+        // Set-Cookie の Domain 属性除去
         if (response.headers.raw && typeof response.headers.raw === 'function') {
             const raw = response.headers.raw();
             const cookies = raw['set-cookie'];
@@ -165,15 +172,18 @@ app.all('*', async (req, res) => {
 
         res.status(response.status);
 
-        // HTMLの場合はテキストとして取得して置換後に送信
-        if (contentType.toLowerCase().includes('text/html')) {
-            let html = await response.text();
-            html = rewriteHtml(html, publicOrigin);
+        // 1. HTML または JavaScript の場合は文字列としてテキスト置換
+        const isHtml = contentType.toLowerCase().includes('text/html');
+        const isJs = contentType.toLowerCase().includes('javascript') || contentType.toLowerCase().includes('ecmascript');
+
+        if (isHtml || isJs) {
+            let text = await response.text();
+            text = rewriteTextContent(text, publicOrigin);
             res.set('Content-Type', contentType);
-            return res.send(html);
+            return res.send(text);
         }
 
-        // HTML以外（CSS, JS, 画像, 動画など）はストリーム処理
+        // 2. その他の静的リソース（CSS、画像、フォント、動画等）はストリーム転送
         return pipeline(response.body, res, (err) => {
             if (err && !res.headersSent) {
                 console.error('Pipeline error:', err);
@@ -192,9 +202,5 @@ app.all('*', async (req, res) => {
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
-    console.log(`====================================`);
-    console.log(`PROXY ENGINE ONLINE`);
-    console.log(`PORT: ${PORT}`);
-    console.log(`WORKER: ${WORKER_URL}`);
-    console.log(`====================================`);
+    console.log(`PROXY ENGINE ONLINE PORT: ${PORT}`);
 });
