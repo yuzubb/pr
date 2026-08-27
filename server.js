@@ -5,7 +5,7 @@ const https = require('https');
 const app = express();
 
 // ==========================================
-// Worker
+// 1. Worker設定
 // ==========================================
 
 const WORKER_CONFIGS = [
@@ -21,7 +21,7 @@ const workers = WORKER_CONFIGS.map(url => ({
 let rrIndex = 0;
 
 // ==========================================
-// HTTPS Agent
+// 2. HTTPS Agent
 // ==========================================
 
 const proxyAgent = new https.Agent({
@@ -31,7 +31,7 @@ const proxyAgent = new https.Agent({
 });
 
 // ==========================================
-// Worker選択
+// 3. Worker選択
 // ==========================================
 
 function getActiveWorker() {
@@ -51,6 +51,8 @@ function getActiveWorker() {
             worker.failCount = 0;
         });
 
+        rrIndex = 0;
+
         return workers[0];
     }
 
@@ -63,7 +65,7 @@ function getActiveWorker() {
 }
 
 // ==========================================
-// Worker失敗
+// 4. Worker失敗
 // ==========================================
 
 function markWorkerFailure(worker) {
@@ -71,7 +73,7 @@ function markWorkerFailure(worker) {
     worker.failCount++;
 
     console.warn(
-        `⚠️ Worker ${worker.url} failed ` +
+        `⚠️ Worker failed: ${worker.url} ` +
         `(${worker.failCount}/3)`
     );
 
@@ -80,13 +82,13 @@ function markWorkerFailure(worker) {
         worker.isAlive = false;
 
         console.error(
-            `🚨 Worker ${worker.url} isolated`
+            `🚨 Worker isolated: ${worker.url}`
         );
     }
 }
 
 // ==========================================
-// Worker成功
+// 5. Worker成功
 // ==========================================
 
 function markWorkerSuccess(worker) {
@@ -96,7 +98,7 @@ function markWorkerSuccess(worker) {
 }
 
 // ==========================================
-// Worker自動復旧
+// 6. Worker自動復旧
 // ==========================================
 
 setInterval(async () => {
@@ -114,11 +116,7 @@ setInterval(async () => {
                 {
                     method: 'GET',
                     agent: proxyAgent,
-                    timeout: 5000,
-                    headers: {
-                        'User-Agent':
-                            'Mozilla/5.0'
-                    }
+                    timeout: 5000
                 }
             );
 
@@ -129,7 +127,7 @@ setInterval(async () => {
             ) {
 
                 console.log(
-                    `✅ Worker ${worker.url} recovered`
+                    `✅ Worker recovered: ${worker.url}`
                 );
 
                 markWorkerSuccess(worker);
@@ -143,7 +141,7 @@ setInterval(async () => {
 }, 30000);
 
 // ==========================================
-// Express Body
+// 7. Request Body
 // ==========================================
 
 app.use(
@@ -154,18 +152,49 @@ app.use(
 );
 
 // ==========================================
-// Proxy
+// 8. メインProxy
 // ==========================================
 
 app.all('*', async (req, res) => {
 
+    // ======================================
+    // Service Workerは絶対にプロキシしない
+    // ======================================
+
+    if (
+        req.path === '/sw.js' ||
+        req.path === '/service-worker.js' ||
+        req.path.endsWith('/sw.js') ||
+        req.path.endsWith('/service-worker.js')
+    ) {
+
+        console.log(
+            `BLOCK SW: ${req.method} ${req.url}`
+        );
+
+        res.set(
+            'Cache-Control',
+            'no-store, no-cache, must-revalidate'
+        );
+
+        return res
+            .status(404)
+            .send('Not Found');
+    }
+
+    // ======================================
     // favicon
+    // ======================================
+
     if (req.path === '/favicon.ico') {
         return res.status(204).end();
     }
 
-    const maxRetries =
-        Math.max(workers.length, 1);
+    // ======================================
+    // Worker
+    // ======================================
+
+    const maxRetries = workers.length;
 
     let attempt = 0;
 
@@ -173,69 +202,44 @@ app.all('*', async (req, res) => {
 
         attempt++;
 
-        const worker =
-            getActiveWorker();
+        const worker = getActiveWorker();
 
         const targetUrl =
-            worker.url + req.originalUrl;
+            worker.url + req.url;
 
-        // ======================================
-        // Browser → Worker Header
-        // ======================================
+        console.log(
+            `➡️ ${req.method} ${targetUrl}`
+        );
+
+        // ==================================
+        // Request Headers
+        // ==================================
 
         const headers = {
             ...req.headers
         };
 
-        // --------------------------------------
-        // プロキシで不要なヘッダーを削除
-        // --------------------------------------
-
+        // プロキシ先へそのまま送ると
+        // 壊れやすいヘッダーを削除
         delete headers.host;
         delete headers.connection;
         delete headers['content-length'];
 
-        // 元サイトの圧縮をnode-fetchに任せる
-        delete headers['accept-encoding'];
+        // ==================================
+        // Forward情報
+        // ==================================
 
-        // --------------------------------------
-        // yuzu3da.com の Origin を送らない
-        // --------------------------------------
+        headers['x-forwarded-host'] =
+            req.get('host') || '';
 
-        delete headers.origin;
+        headers['x-forwarded-proto'] =
+            'https';
 
-        // --------------------------------------
-        // yuzu3da.com の Referer を送らない
-        // --------------------------------------
-
-        delete headers.referer;
-
-        // --------------------------------------
-        // Forwarded系も送らない
-        // --------------------------------------
-
-        delete headers['x-forwarded-host'];
-        delete headers['x-forwarded-proto'];
-        delete headers['x-forwarded-for'];
-
-        // ======================================
-        // Workerへ送る情報
-        // ======================================
-
-        if (!headers['user-agent']) {
-
-            headers['user-agent'] =
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) ' +
-                'AppleWebKit/605.1.15 ' +
-                '(KHTML, like Gecko) ' +
-                'Version/18.0 Mobile/15E148 Safari/604.1';
-        }
+        // ==================================
+        // Proxy Request
+        // ==================================
 
         try {
-
-            console.log(
-                `➡️ ${req.method} ${targetUrl}`
-            );
 
             const response = await fetch(
                 targetUrl,
@@ -260,20 +264,24 @@ app.all('*', async (req, res) => {
                 }
             );
 
-            console.log(
-                `⬅️ ${response.status} ${targetUrl}`
-            );
-
             // ==================================
-            // Workerエラー
+            // Worker Server Error
             // ==================================
 
             if (response.status >= 500) {
+
+                console.warn(
+                    `⚠️ Worker returned ${response.status}`
+                );
 
                 markWorkerFailure(worker);
 
                 continue;
             }
+
+            // ==================================
+            // Worker成功
+            // ==================================
 
             markWorkerSuccess(worker);
 
@@ -283,8 +291,8 @@ app.all('*', async (req, res) => {
 
             const blockedHeaders = new Set([
                 'content-encoding',
-                'content-length',
                 'transfer-encoding',
+                'content-length',
                 'content-security-policy',
                 'content-security-policy-report-only'
             ]);
@@ -292,20 +300,59 @@ app.all('*', async (req, res) => {
             response.headers.forEach(
                 (value, key) => {
 
+                    const lower =
+                        key.toLowerCase();
+
                     if (
-                        blockedHeaders.has(
-                            key.toLowerCase()
-                        )
+                        blockedHeaders.has(lower)
                     ) {
                         return;
                     }
 
-                    res.set(
-                        key,
-                        value
-                    );
+                    // Set-Cookieは後で処理
+                    if (lower === 'set-cookie') {
+                        return;
+                    }
+
+                    res.set(key, value);
                 }
             );
+
+            // ==================================
+            // Cookie処理
+            // ==================================
+
+            if (
+                response.headers.raw &&
+                typeof response.headers.raw === 'function'
+            ) {
+
+                const cookies =
+                    response.headers
+                        .raw()['set-cookie'];
+
+                if (
+                    cookies &&
+                    cookies.length > 0
+                ) {
+
+                    const rewrittenCookies =
+                        cookies.map(cookie => {
+
+                            // aniwaves.ruのDomainを
+                            // ブラウザ側ドメインに固定しない
+                            return cookie.replace(
+                                /;\s*Domain=[^;]*/gi,
+                                ''
+                            );
+                        });
+
+                    res.setHeader(
+                        'Set-Cookie',
+                        rewrittenCookies
+                    );
+                }
+            }
 
             // ==================================
             // Content-Type
@@ -319,6 +366,17 @@ app.all('*', async (req, res) => {
             // ==================================
             // HTML
             // ==================================
+            //
+            // ★重要
+            // HTMLは一切書き換えない
+            //
+            // 広告削除もしない
+            // script注入もしない
+            // DOM変更もしない
+            //
+            // これで黒画面の原因になる
+            // HTML破壊を完全に避ける
+            // ==================================
 
             if (
                 contentType
@@ -330,22 +388,15 @@ app.all('*', async (req, res) => {
                     await response.text();
 
                 console.log(
-                    `📄 HTML ${html.length} bytes`
+                    `HTML ${Buffer.byteLength(
+                        html,
+                        'utf8'
+                    )} bytes`
                 );
-
-                // ==================================
-                // HTMLは完全にそのまま返す
-                // 広告削除なし
-                // JS注入なし
-                // HTML書き換えなし
-                // ==================================
 
                 res.set(
                     'Content-Type',
-                    response.headers.get(
-                        'content-type'
-                    ) ||
-                    'text/html; charset=utf-8'
+                    contentType
                 );
 
                 return res
@@ -358,7 +409,7 @@ app.all('*', async (req, res) => {
             // ==================================
 
             if (
-                req.originalUrl.includes('_p_')
+                req.url.includes('_p_')
             ) {
 
                 res.set(
@@ -368,19 +419,17 @@ app.all('*', async (req, res) => {
             }
 
             // ==================================
-            // Streaming
+            // その他のファイル
             // ==================================
 
-            res.status(
-                response.status
-            );
+            res.status(response.status);
 
             return response.body.pipe(res);
 
         } catch (error) {
 
             console.error(
-                `❌ Attempt ${attempt} failed:`,
+                `❌ Attempt ${attempt} failed`,
                 error.message
             );
 
@@ -393,7 +442,7 @@ app.all('*', async (req, res) => {
     // ==========================================
 
     console.error(
-        '❌ All workers failed'
+        '🚨 ALL WORKERS FAILED'
     );
 
     if (!res.headersSent) {
@@ -407,7 +456,7 @@ app.all('*', async (req, res) => {
 });
 
 // ==========================================
-// Start
+// 9. 起動
 // ==========================================
 
 const PORT =
@@ -417,32 +466,34 @@ app.listen(
     PORT,
     () => {
 
+        console.log('');
         console.log(
-            '======================================'
+            '=========================================='
         );
-
         console.log(
-            '   PROXY ENGINE ONLINE'
+            '        PROXY ENGINE ONLINE'
         );
-
         console.log(
-            `   PORT: ${PORT}`
+            '=========================================='
         );
-
         console.log(
-            '   WORKER: https://aniwaves.ru'
+            `PORT: ${PORT}`
         );
-
         console.log(
-            '   HTML REWRITE: OFF'
+            `WORKER: ${WORKER_CONFIGS.join(', ')}`
         );
-
         console.log(
-            '   AD CLEANER: OFF'
+            'HTML REWRITE: OFF'
         );
-
         console.log(
-            '======================================'
+            'AD CLEANER: OFF'
         );
+        console.log(
+            'SERVICE WORKER: BLOCKED'
+        );
+        console.log(
+            '=========================================='
+        );
+        console.log('');
     }
 );
