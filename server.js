@@ -55,17 +55,17 @@ app.use(
     })
 );
 
-// HTML / JS テキストのドメイン置換処理
+// HTML / JS テキストの置換処理
 function rewriteTextContent(content, publicOrigin) {
-    // 1. 絶対URL & プロトコル相対URL の置換
+    // 1. ドメインの置き換え
     let rewritten = content.replace(/https?:\/\/aniwaves\.ru/gi, publicOrigin);
     rewritten = rewritten.replace(/\/\/aniwaves\.ru/gi, publicOrigin.replace(/^https?:/, ''));
 
-    // 2. Service Worker 登録文を無効化（SecurityError によるスクリプト停止を防ぐ）
-    rewritten = rewritten.replace(/navigator\.serviceWorker\.register/g, 'console.log');
+    // 2. Service Worker 登録文を無効化（SecurityError による動作停止の防止）
+    rewritten = rewritten.replace(/navigator\.serviceWorker\.register\s*\([^)]+\)/g, 'Promise.reject("Disabled")');
 
-    // 3. アンチデバッグ文 (debugger;) の除去
-    rewritten = rewritten.replace(/debugger;/g, '').replace(/debugger/g, '');
+    // 3. 構文を壊さない安全な debugger の無効化 (単体キーワード文のみ空白化)
+    rewritten = rewritten.replace(/(^|[\s;{}])debugger\s*(;|\n|$)/g, '$1/* debugger */$2');
 
     return rewritten;
 }
@@ -81,7 +81,7 @@ function rewriteLocation(location, publicOrigin) {
     return location;
 }
 
-// Service Worker 自体のリクエストはダミーを返す
+// Service Worker リクエストには空のJSを返す
 app.get(['/sw.js', '/service-worker.js'], (req, res) => {
     res.set('Content-Type', 'application/javascript');
     res.set('Cache-Control', 'no-store');
@@ -136,7 +136,7 @@ app.all('*', async (req, res) => {
         workerSuccess(worker);
 
         const contentType = response.headers.get('content-type') || '';
-        
+
         const blockedHeaders = new Set([
             'content-length',
             'content-encoding',
@@ -158,7 +158,7 @@ app.all('*', async (req, res) => {
             res.set(key, value);
         });
 
-        // Set-Cookie の Domain 属性除去
+        // Set-Cookie の Domain 除去
         if (response.headers.raw && typeof response.headers.raw === 'function') {
             const raw = response.headers.raw();
             const cookies = raw['set-cookie'];
@@ -172,10 +172,10 @@ app.all('*', async (req, res) => {
 
         res.status(response.status);
 
-        // 1. HTML または JavaScript の場合は文字列としてテキスト置換
         const isHtml = contentType.toLowerCase().includes('text/html');
         const isJs = contentType.toLowerCase().includes('javascript') || contentType.toLowerCase().includes('ecmascript');
 
+        // HTML・JS はテキスト置換を実施
         if (isHtml || isJs) {
             let text = await response.text();
             text = rewriteTextContent(text, publicOrigin);
@@ -183,7 +183,7 @@ app.all('*', async (req, res) => {
             return res.send(text);
         }
 
-        // 2. その他の静的リソース（CSS、画像、フォント、動画等）はストリーム転送
+        // その他の静的ファイルはストリーム転送
         return pipeline(response.body, res, (err) => {
             if (err && !res.headersSent) {
                 console.error('Pipeline error:', err);
