@@ -4,25 +4,17 @@ const https = require('https');
 
 const app = express();
 
-// ==========================================
-// 1. Worker設定
-// ==========================================
+const WORKER_URL = 'https://aniwaves.ru';
 
-const WORKER_CONFIGS = [
-    'https://aniwaves.ru'
+const workers = [
+    {
+        url: WORKER_URL,
+        isAlive: true,
+        failCount: 0
+    }
 ];
 
-const workers = WORKER_CONFIGS.map(url => ({
-    url: url.replace(/\/$/, ''),
-    isAlive: true,
-    failCount: 0
-}));
-
 let rrIndex = 0;
-
-// ==========================================
-// 2. HTTPS Agent
-// ==========================================
 
 const proxyAgent = new https.Agent({
     keepAlive: true,
@@ -31,117 +23,43 @@ const proxyAgent = new https.Agent({
 });
 
 // ==========================================
-// 3. Worker選択
+// Worker
 // ==========================================
 
-function getActiveWorker() {
+function getWorker() {
+    const active = workers.filter(w => w.isAlive);
 
-    const active = workers.filter(
-        worker => worker.isAlive
-    );
-
-    if (active.length === 0) {
-
-        console.warn(
-            '⚠️ ALL WORKERS DOWN - RESETTING'
-        );
-
-        workers.forEach(worker => {
-            worker.isAlive = true;
-            worker.failCount = 0;
+    if (!active.length) {
+        workers.forEach(w => {
+            w.isAlive = true;
+            w.failCount = 0;
         });
-
-        rrIndex = 0;
 
         return workers[0];
     }
 
-    const worker =
-        active[rrIndex % active.length];
-
-    rrIndex++;
-
-    return worker;
+    return active[rrIndex++ % active.length];
 }
 
-// ==========================================
-// 4. Worker失敗
-// ==========================================
-
-function markWorkerFailure(worker) {
-
-    worker.failCount++;
-
-    console.warn(
-        `⚠️ Worker failed: ${worker.url} ` +
-        `(${worker.failCount}/3)`
-    );
-
-    if (worker.failCount >= 3) {
-
-        worker.isAlive = false;
-
-        console.error(
-            `🚨 Worker isolated: ${worker.url}`
-        );
-    }
-}
-
-// ==========================================
-// 5. Worker成功
-// ==========================================
-
-function markWorkerSuccess(worker) {
-
+function workerSuccess(worker) {
     worker.failCount = 0;
     worker.isAlive = true;
 }
 
-// ==========================================
-// 6. Worker自動復旧
-// ==========================================
+function workerFailure(worker) {
+    worker.failCount++;
 
-setInterval(async () => {
+    console.log(
+        `Worker failure ${worker.failCount}/3: ${worker.url}`
+    );
 
-    for (const worker of workers) {
-
-        if (worker.isAlive) {
-            continue;
-        }
-
-        try {
-
-            const response = await fetch(
-                worker.url + '/favicon.ico',
-                {
-                    method: 'GET',
-                    agent: proxyAgent,
-                    timeout: 5000
-                }
-            );
-
-            if (
-                response.ok ||
-                response.status === 404 ||
-                response.status === 302
-            ) {
-
-                console.log(
-                    `✅ Worker recovered: ${worker.url}`
-                );
-
-                markWorkerSuccess(worker);
-            }
-
-        } catch {
-            // まだ復旧していない
-        }
+    if (worker.failCount >= 3) {
+        worker.isAlive = false;
     }
-
-}, 30000);
+}
 
 // ==========================================
-// 7. Request Body
+// Body
 // ==========================================
 
 app.use(
@@ -152,311 +70,350 @@ app.use(
 );
 
 // ==========================================
-// 8. メインProxy
+// HTML URL rewrite
 // ==========================================
 
-app.all('*', async (req, res) => {
+function rewriteHtml(html, publicOrigin) {
 
-    // ======================================
-    // Service Workerは絶対にプロキシしない
-    // ======================================
+    // 絶対URL
+    html = html.replace(
+        /https?:\/\/aniwaves\.ru/gi,
+        publicOrigin
+    );
+
+    // //aniwaves.ru
+    html = html.replace(
+        /\/\/aniwaves\.ru/gi,
+        publicOrigin.replace(/^https?:/, '')
+    );
+
+    return html;
+}
+
+// ==========================================
+// Location rewrite
+// ==========================================
+
+function rewriteLocation(location, publicOrigin) {
+
+    if (!location) {
+        return location;
+    }
 
     if (
-        req.path === '/sw.js' ||
-        req.path === '/service-worker.js' ||
-        req.path.endsWith('/sw.js') ||
-        req.path.endsWith('/service-worker.js')
+        location.startsWith(WORKER_URL)
     ) {
+        return (
+            publicOrigin +
+            location.substring(WORKER_URL.length)
+        );
+    }
+
+    if (
+        location.startsWith('//aniwaves.ru')
+    ) {
+        return (
+            publicOrigin.replace(/^https?:/, '') +
+            location.substring('//aniwaves.ru'.length)
+        );
+    }
+
+    return location;
+}
+
+// ==========================================
+// Service Worker
+// ==========================================
+
+app.get(
+    ['/sw.js', '/service-worker.js'],
+    (req, res) => {
 
         console.log(
-            `BLOCK SW: ${req.method} ${req.url}`
+            `BLOCK SERVICE WORKER: ${req.url}`
         );
 
         res.set(
             'Cache-Control',
-            'no-store, no-cache, must-revalidate'
+            'no-store'
         );
 
         return res
             .status(404)
             .send('Not Found');
     }
+);
 
-    // ======================================
-    // favicon
-    // ======================================
+// ==========================================
+// favicon
+// ==========================================
 
-    if (req.path === '/favicon.ico') {
-        return res.status(204).end();
+app.get(
+    '/favicon.ico',
+    (req, res) => {
+        res.status(204).end();
     }
+);
+
+// ==========================================
+// Proxy
+// ==========================================
+
+app.all('*', async (req, res) => {
+
+    const worker = getWorker();
+
+    const publicOrigin =
+        `${req.protocol}://${req.get('host')}`;
+
+    const targetUrl =
+        worker.url + req.originalUrl;
+
+    console.log(
+        `➡️ ${req.method} ${targetUrl}`
+    );
+
+    const headers = {
+        ...req.headers
+    };
 
     // ======================================
-    // Worker
+    // 不要なHost系
     // ======================================
 
-    const maxRetries = workers.length;
+    delete headers.host;
+    delete headers.connection;
+    delete headers['content-length'];
 
-    let attempt = 0;
+    // ======================================
+    // Workerへ正しいOrigin/Refererを送る
+    // ======================================
 
-    while (attempt < maxRetries) {
+    headers.origin = worker.url;
 
-        attempt++;
+    headers.referer =
+        worker.url + '/';
 
-        const worker = getActiveWorker();
+    // ======================================
+    // Forward
+    // ======================================
 
-        const targetUrl =
-            worker.url + req.url;
+    headers['x-forwarded-host'] =
+        req.get('host') || '';
+
+    headers['x-forwarded-proto'] =
+        'https';
+
+    try {
+
+        const response = await fetch(
+            targetUrl,
+            {
+                method: req.method,
+
+                headers,
+
+                agent: proxyAgent,
+
+                redirect: 'follow',
+
+                compress: true,
+
+                timeout: 20000,
+
+                body:
+                    req.method !== 'GET' &&
+                    req.method !== 'HEAD'
+                        ? req.body
+                        : undefined
+            }
+        );
 
         console.log(
-            `➡️ ${req.method} ${targetUrl}`
+            `⬅️ ${response.status} ${targetUrl}`
         );
 
         // ==================================
-        // Request Headers
+        // Worker failure
         // ==================================
 
-        const headers = {
-            ...req.headers
-        };
+        if (response.status >= 500) {
 
-        // プロキシ先へそのまま送ると
-        // 壊れやすいヘッダーを削除
-        delete headers.host;
-        delete headers.connection;
-        delete headers['content-length'];
+            workerFailure(worker);
 
-        // ==================================
-        // Forward情報
-        // ==================================
-
-        headers['x-forwarded-host'] =
-            req.get('host') || '';
-
-        headers['x-forwarded-proto'] =
-            'https';
-
-        // ==================================
-        // Proxy Request
-        // ==================================
-
-        try {
-
-            const response = await fetch(
-                targetUrl,
-                {
-                    method: req.method,
-
-                    headers,
-
-                    agent: proxyAgent,
-
-                    compress: true,
-
-                    redirect: 'follow',
-
-                    timeout: 20000,
-
-                    body:
-                        req.method !== 'GET' &&
-                        req.method !== 'HEAD'
-                            ? req.body
-                            : undefined
-                }
-            );
-
-            // ==================================
-            // Worker Server Error
-            // ==================================
-
-            if (response.status >= 500) {
-
-                console.warn(
-                    `⚠️ Worker returned ${response.status}`
+            return res
+                .status(response.status)
+                .send(
+                    `Worker returned ${response.status}`
                 );
+        }
 
-                markWorkerFailure(worker);
+        workerSuccess(worker);
 
-                continue;
-            }
+        // ==================================
+        // Response headers
+        // ==================================
 
-            // ==================================
-            // Worker成功
-            // ==================================
+        const contentType =
+            response.headers.get(
+                'content-type'
+            ) || '';
 
-            markWorkerSuccess(worker);
+        const blockedHeaders = new Set([
+            'content-length',
+            'content-encoding',
+            'transfer-encoding',
+            'content-security-policy',
+            'content-security-policy-report-only'
+        ]);
 
-            // ==================================
-            // Response Headers
-            // ==================================
+        response.headers.forEach(
+            (value, key) => {
 
-            const blockedHeaders = new Set([
-                'content-encoding',
-                'transfer-encoding',
-                'content-length',
-                'content-security-policy',
-                'content-security-policy-report-only'
-            ]);
-
-            response.headers.forEach(
-                (value, key) => {
-
-                    const lower =
-                        key.toLowerCase();
-
-                    if (
-                        blockedHeaders.has(lower)
-                    ) {
-                        return;
-                    }
-
-                    // Set-Cookieは後で処理
-                    if (lower === 'set-cookie') {
-                        return;
-                    }
-
-                    res.set(key, value);
-                }
-            );
-
-            // ==================================
-            // Cookie処理
-            // ==================================
-
-            if (
-                response.headers.raw &&
-                typeof response.headers.raw === 'function'
-            ) {
-
-                const cookies =
-                    response.headers
-                        .raw()['set-cookie'];
+                const lower =
+                    key.toLowerCase();
 
                 if (
-                    cookies &&
-                    cookies.length > 0
+                    blockedHeaders.has(lower)
                 ) {
+                    return;
+                }
 
-                    const rewrittenCookies =
-                        cookies.map(cookie => {
+                if (lower === 'location') {
 
-                            // aniwaves.ruのDomainを
-                            // ブラウザ側ドメインに固定しない
-                            return cookie.replace(
-                                /;\s*Domain=[^;]*/gi,
+                    const newLocation =
+                        rewriteLocation(
+                            value,
+                            publicOrigin
+                        );
+
+                    res.set(
+                        'Location',
+                        newLocation
+                    );
+
+                    return;
+                }
+
+                if (lower === 'set-cookie') {
+                    return;
+                }
+
+                res.set(
+                    key,
+                    value
+                );
+            }
+        );
+
+        // ==================================
+        // Cookies
+        // ==================================
+
+        if (
+            response.headers.raw &&
+            typeof response.headers.raw === 'function'
+        ) {
+
+            const raw =
+                response.headers.raw();
+
+            const cookies =
+                raw['set-cookie'];
+
+            if (
+                cookies &&
+                cookies.length
+            ) {
+
+                const rewrittenCookies =
+                    cookies.map(cookie => {
+
+                        return cookie
+                            .replace(
+                                /;\s*Domain=[^;]+/gi,
                                 ''
                             );
-                        });
+                    });
 
-                    res.setHeader(
-                        'Set-Cookie',
-                        rewrittenCookies
-                    );
-                }
-            }
-
-            // ==================================
-            // Content-Type
-            // ==================================
-
-            const contentType =
-                response.headers.get(
-                    'content-type'
-                ) || '';
-
-            // ==================================
-            // HTML
-            // ==================================
-            //
-            // ★重要
-            // HTMLは一切書き換えない
-            //
-            // 広告削除もしない
-            // script注入もしない
-            // DOM変更もしない
-            //
-            // これで黒画面の原因になる
-            // HTML破壊を完全に避ける
-            // ==================================
-
-            if (
-                contentType
-                    .toLowerCase()
-                    .includes('text/html')
-            ) {
-
-                const html =
-                    await response.text();
-
-                console.log(
-                    `HTML ${Buffer.byteLength(
-                        html,
-                        'utf8'
-                    )} bytes`
-                );
-
-                res.set(
-                    'Content-Type',
-                    contentType
-                );
-
-                return res
-                    .status(response.status)
-                    .send(html);
-            }
-
-            // ==================================
-            // 静的ファイル
-            // ==================================
-
-            if (
-                req.url.includes('_p_')
-            ) {
-
-                res.set(
-                    'Cache-Control',
-                    'public, max-age=31536000, immutable'
+                res.setHeader(
+                    'Set-Cookie',
+                    rewrittenCookies
                 );
             }
-
-            // ==================================
-            // その他のファイル
-            // ==================================
-
-            res.status(response.status);
-
-            return response.body.pipe(res);
-
-        } catch (error) {
-
-            console.error(
-                `❌ Attempt ${attempt} failed`,
-                error.message
-            );
-
-            markWorkerFailure(worker);
         }
-    }
 
-    // ==========================================
-    // 全Worker失敗
-    // ==========================================
+        // ==================================
+        // HTML
+        // ==================================
 
-    console.error(
-        '🚨 ALL WORKERS FAILED'
-    );
+        if (
+            contentType
+                .toLowerCase()
+                .includes('text/html')
+        ) {
 
-    if (!res.headersSent) {
+            let html =
+                await response.text();
 
-        return res
-            .status(502)
-            .send(
-                'Proxy Service Unavailable'
+            console.log(
+                `HTML SIZE: ${Buffer.byteLength(
+                    html,
+                    'utf8'
+                )} bytes`
             );
+
+            // ==================================
+            // Worker URL → Proxy URL
+            // ==================================
+
+            html =
+                rewriteHtml(
+                    html,
+                    publicOrigin
+                );
+
+            res.set(
+                'Content-Type',
+                contentType
+            );
+
+            return res
+                .status(response.status)
+                .send(html);
+        }
+
+        // ==================================
+        // その他
+        // ==================================
+
+        res.status(response.status);
+
+        return response.body.pipe(res);
+
+    } catch (error) {
+
+        console.error(
+            'PROXY ERROR:',
+            error.message
+        );
+
+        workerFailure(worker);
+
+        if (!res.headersSent) {
+
+            return res
+                .status(502)
+                .send(
+                    'Proxy error: ' +
+                    error.message
+                );
+        }
     }
 });
 
 // ==========================================
-// 9. 起動
+// Start
 // ==========================================
 
 const PORT =
@@ -466,34 +423,36 @@ app.listen(
     PORT,
     () => {
 
-        console.log('');
         console.log(
-            '=========================================='
+            '===================================='
         );
+
         console.log(
-            '        PROXY ENGINE ONLINE'
+            'PROXY ENGINE ONLINE'
         );
-        console.log(
-            '=========================================='
-        );
+
         console.log(
             `PORT: ${PORT}`
         );
+
         console.log(
-            `WORKER: ${WORKER_CONFIGS.join(', ')}`
+            `WORKER: ${WORKER_URL}`
         );
+
         console.log(
-            'HTML REWRITE: OFF'
+            'HTML REWRITE: URL ONLY'
         );
+
         console.log(
             'AD CLEANER: OFF'
         );
+
         console.log(
             'SERVICE WORKER: BLOCKED'
         );
+
         console.log(
-            '=========================================='
+            '===================================='
         );
-        console.log('');
     }
 );
