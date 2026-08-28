@@ -5,7 +5,7 @@ const { pipeline } = require('stream');
 
 const app = express();
 
-const WORKER_URL = 'https://aniwaves.ru';
+const WORKER_URL = 'https://www.youtube.com';
 
 const workers = [
     {
